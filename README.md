@@ -59,27 +59,27 @@ Edit the `model_config.json` file to select the desired model. Set the `active_m
 
 <pre><code class="language-json">
 {
-  <b>"active_model_key": "<span style="color:blue;">default_torch</span>"</b>,
+  <b>"active_model_key": "<i>default_torch</i>"</b>,
   "available_models": {
-    <b>"<span style="color:green;">default_torch</span>"</b>: {
+    <b>"<i>default_torch</i>"</b>: {
       "framework": "torch",
       "model_id": "GSAI-ML/LLaDA-8B-Instruct",
       "description": "Original LLaDA Instruct model (requires custom code)",
       "trust_remote_code": true
     },
-    <b>"<span style="color:green;">base_torch</span>"</b>: {
+    <b>"<i>base_torch</i>"</b>: {
       "framework": "torch",
       "model_id": "GSAI-ML/LLaDA-8B-Base",
       "description": "Original LLaDA Base model (requires custom code)",
       "trust_remote_code": true
     },
-    <b>"<span style="color:gray;">dlpo_torch</span>"</b>: {
+    <b>"<i>dlpo_torch</i>"</b>: {
       "framework": "torch",
       "model_id": "howey/LLaDA-8B-Instruct-DLPO",
       "description": "DLPO fine-tuned variant (INCOMPATIBLE with current custom code - WIP)",
       "trust_remote_code": true
     },
-    <b>"<span style="color:green;">default_mlx</span>"</b>: {
+    <b>"<i>default_mlx</i>"</b>: {
       "framework": "mlx",
       "model_id": "mlx-community/LLaDA-8B-Instruct-mlx-8bit",
       "description": "MLX quantized version (requires mlx-lm, for macOS only)",
