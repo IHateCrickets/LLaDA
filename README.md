@@ -46,8 +46,9 @@ Ensure your virtual environment is activated.
 ```bash
 # Use pip within the uv environment
 python -m pip install -r requirements.txt
+
 # Or using uv directly (recommended):
-# uv pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 _(Note: The command `python -m pip ...` explicitly uses the Python interpreter from the active virtual environment.)_
@@ -58,30 +59,30 @@ Edit the `model_config.json` file to select the desired model. Set the `active_m
 
 ```json
 {
-  "active_model_key": "default_torch",
+  <b>"active_model_key": "default_torch"</b>,
   "available_models": {
-    "default_torch": {
+    <b>"default_torch"</b>: {
       "framework": "torch",
       "model_id": "GSAI-ML/LLaDA-8B-Instruct",
       "description": "Original LLaDA Instruct model (requires custom code)",
       "trust_remote_code": true
     },
-    "base_torch": {
+    <b>"base_torch"</b>: {
       "framework": "torch",
       "model_id": "GSAI-ML/LLaDA-8B-Base",
       "description": "Original LLaDA Base model (requires custom code)",
       "trust_remote_code": true
     },
-    "dlpo_torch": {
+    <b>"dlpo_torch"</b>: {
       "framework": "torch",
       "model_id": "howey/LLaDA-8B-Instruct-DLPO",
-      "description": "DLPO fine-tuned variant (INCOMPATIBLE with current custom code)",
+      "description": "DLPO fine-tuned variant (INCOMPATIBLE with current custom code - WIP)",
       "trust_remote_code": true
     },
-    "default_mlx": {
+    <b>"default_mlx"</b>: {
       "framework": "mlx",
       "model_id": "mlx-community/LLaDA-8B-Instruct-mlx-8bit",
-      "description": "MLX quantized version (requires mlx-lm, likely macOS only)",
+      "description": "MLX quantized version (requires mlx-lm, for macOS only)",
       "trust_remote_code": true
     }
   }
@@ -122,6 +123,35 @@ This project aims for cross-platform compatibility (Windows, macOS, Linux), but 
   - Requires a compatible web browser (Chrome, Edge, or Chromium) to be installed on the system.
   - The browser's executable must be findable via the system's PATH environment variable. The script includes a check for this and will provide an error message if a browser is not found.
 - **Logging:** Log messages use ANSI color codes, which display best in modern terminals (like Windows Terminal, macOS Terminal, most Linux terminals). Legacy terminals (like older Windows `cmd.exe`) might show raw escape codes instead of colors.
+
+## Inference
+
+The [LLaDA-8B-Base](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) and [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) are uploaded
+in Huggingface. Please first install `transformers==4.38.2` and employ the [transformers](https://huggingface.co/docs/transformers/index) to load.
+
+```angular2html
+from transformers import AutoModel, AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True)
+model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True, torch_dtype=torch.bfloat16)
+```
+
+We provide `get_log_likelihood()` and `generate()` functions in `get_log_likelihood.py`
+and `generate.py` respectively, for conditional likelihood evaluation and conditional generation.
+
+You can directly run `python chat.py` to have multi-round conversations with LLaDA-8B-Instruct.
+
+In addition, please refer to our paper and [GUIDELINES.md](GUIDELINES.md) for more details about the inference methods.
+
+## Gradio demo
+
+Thank you very much to [apolinário](https://github.com/apolinario) for helping us create this amazing demo!
+
+First, install [Gradio](https://www.gradio.app) `pip install gradio`, and then you can directly run `python app.py`
+
+<div style="display: flex; justify-content: center; flex-wrap: wrap;">
+    <img src="./imgs/example_gradio.gif" style="width: 80%" />
+</div>
 
 ## Pre-training and Supervised Fine-Tuning
 
