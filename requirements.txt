@@ -1,0 +1,22 @@
+# Core ML/Torch dependencies
+torch>=2.0.0
+transformers>=4.38.0
+accelerate>=0.25.0 # For evaluation script
+datasets>=2.0.0 # For evaluation script
+
+# General utility
+numpy>=1.20.0
+tqdm>=4.60.0 # For progress bars, used in evaluation
+
+# Web UI & Visualization
+gradio>=4.0.0
+html2image>=2.0.0 # For visualization script
+
+# Evaluation Harness
+lm-eval>=0.4.0 # For evaluation script
+
+# Optional Performance (Requires CUDA setup & separate install if desired)
+# flash-attn>=2.0.0
+
+# Optional MLX support for MacOS (Requires separate install if desired)
+# mlx-lm>=0.21.0

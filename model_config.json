@@ -1,0 +1,29 @@
+{
+  "active_model_key": "base_torch",
+  "available_models": {
+    "default_torch": {
+      "framework": "torch",
+      "model_id": "GSAI-ML/LLaDA-8B-Instruct",
+      "description": "Original LLaDA Instruct model (requires custom code)",
+      "trust_remote_code": true
+    },
+    "base_torch": {
+      "framework": "torch",
+      "model_id": "GSAI-ML/LLaDA-8B-Base",
+      "description": "Original LLaDA Base model (requires custom code)",
+      "trust_remote_code": true
+    },
+    "dlpo_torch": {
+      "framework": "torch",
+      "model_id": "howey/LLaDA-8B-Instruct-DLPO",
+      "description": "DLPO fine-tuned variant (INCOMPATIBLE with current custom code)",
+      "trust_remote_code": true
+    },
+    "default_mlx": {
+      "framework": "mlx",
+      "model_id": "mlx-community/LLaDA-8B-Instruct-mlx-8bit",
+      "description": "MLX quantized version (requires mlx-lm, for macOS only)",
+      "trust_remote_code": true
+    }
+  }
+}

@@ -2,292 +2,403 @@ import torch
 import numpy as np
 import gradio as gr
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
 import time
 import re
+import sys
+import os # Added for os._exit
+import importlib
+import json
+import logging
+from log_utils import log
+import webbrowser
+import threading
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Using device: {device}")
+# --- Configuration Loading ---
+# ... (Config loading code remains the same) ...
+CONFIG_FILE = "model_config.json"
+DEFAULT_FRAMEWORK = "torch"
+DEFAULT_MODEL_KEY = "default_torch"
+DEFAULT_MODEL_CONFIG = {
+    "framework": DEFAULT_FRAMEWORK,
+    "model_id": "GSAI-ML/LLaDA-8B-Instruct",
+    "trust_remote_code": True
+}
 
-# Load model and tokenizer
-tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, 
-                                  torch_dtype=torch.bfloat16).to(device)
+config_framework = DEFAULT_FRAMEWORK
+config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
 
-# Constants
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        config_data = json.load(f)
+        active_key = config_data.get("active_model_key", DEFAULT_MODEL_KEY)
+        available_models = config_data.get("available_models", {})
+
+        if active_key in available_models:
+            model_config = available_models[active_key]
+            config_framework = model_config.get("framework", DEFAULT_FRAMEWORK).lower()
+            config_model_id = model_config.get("model_id")
+            config_trust_remote_code = model_config.get("trust_remote_code", False)
+
+            if not config_model_id:
+                log("ERROR", f"Missing 'model_id' for active key '{active_key}' in {CONFIG_FILE}. Using defaults.")
+                config_framework = DEFAULT_FRAMEWORK
+                config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+                config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
+            else:
+                 log("INFO", f"Loaded configuration from {CONFIG_FILE} for key '{active_key}': framework='{config_framework}', model_id='{config_model_id}', trust_remote_code={config_trust_remote_code}")
+
+        else:
+            log("ERROR", f"Active model key '{active_key}' not found in 'available_models' in {CONFIG_FILE}. Using defaults.")
+            config_framework = DEFAULT_FRAMEWORK
+            config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+            config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
+
+except FileNotFoundError:
+    log("WARNING", f"{CONFIG_FILE} not found. Using default model '{DEFAULT_MODEL_CONFIG['model_id']}'.")
+    config_framework = DEFAULT_FRAMEWORK
+    config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+    config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
+except json.JSONDecodeError:
+    log("ERROR", f"Error decoding {CONFIG_FILE}. Using default model '{DEFAULT_MODEL_CONFIG['model_id']}'.")
+    config_framework = DEFAULT_FRAMEWORK
+    config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+    config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
+except Exception as e:
+    log("ERROR", f"Error loading {CONFIG_FILE}: {e}. Using default model '{DEFAULT_MODEL_CONFIG['model_id']}'.")
+    config_framework = DEFAULT_FRAMEWORK
+    config_model_id = DEFAULT_MODEL_CONFIG["model_id"]
+    config_trust_remote_code = DEFAULT_MODEL_CONFIG["trust_remote_code"]
+
+# --- Global Variables ---
+model = None
+tokenizer = None
+device = None
+framework = config_framework
+mlx_generate = None
+demo_instance = None
+
+# --- Helper Function Definitions ---
+def add_gumbel_noise(logits, temperature):
+    if temperature <= 0: return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (- torch.log(noise + 1e-9)) ** temperature
+    return logits.exp() / (gumbel_noise + 1e-9)
+
+def get_num_transfer_tokens(mask_index, steps):
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+    steps = max(1, int(steps))
+    base = mask_num // steps
+    remainder = mask_num % steps
+    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
+    for i in range(mask_num.size(0)):
+        rem_val = remainder[i].item()
+        if rem_val > 0: num_transfer_tokens[i, :rem_val] += 1
+    return num_transfer_tokens
+
+# --- Framework-Specific Loading ---
+if framework == "torch":
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from configuration_llada import LLaDAConfig
+        modeling_llada = importlib.import_module("modeling_llada")
+        LLaDAModelLM = modeling_llada.LLaDAModelLM
+        log("INFO", "Using Framework: PyTorch")
+
+        if torch.cuda.is_available():
+            device = 'cuda'
+            dtype = torch.bfloat16
+            log("INFO", "CUDA detected. Using GPU with bfloat16.")
+        else:
+            device = 'cpu'
+            dtype = torch.float32
+            log("INFO", "CUDA not available. Using CPU with float32.")
+
+        log("INFO", f"Loading PyTorch model: {config_model_id}...")
+        assert isinstance(config_model_id, str), f"Model ID must be a string, got: {type(config_model_id)}"
+        tokenizer = AutoTokenizer.from_pretrained(config_model_id, trust_remote_code=config_trust_remote_code)
+
+        model_loaded_successfully = False
+        try:
+            log("INFO", f"Attempt 1: Loading model {config_model_id} using AutoModelForCausalLM with trust_remote_code={config_trust_remote_code}")
+            model = AutoModelForCausalLM.from_pretrained(
+                config_model_id,
+                trust_remote_code=config_trust_remote_code,
+                torch_dtype=dtype
+            ).to(device).eval()
+            log("INFO", "Attempt 1: Successfully loaded model using AutoModelForCausalLM.")
+            model_loaded_successfully = True
+
+        except Exception as e1:
+            error_str = str(e1).lower()
+            log("WARNING", f"Attempt 1 failed: {e1}")
+            log("DEBUG", f"Attempt 1 error string (lower): {error_str}")
+
+            if "data did not match" in error_str:
+                log("WARNING", f"Caught specific incompatibility error. Attempting fallback with local LLaDAModelLM and force_download=True.")
+                try:
+                    log("INFO", f"Attempt 2: Loading config explicitly for {config_model_id} using local LLaDAConfig with trust_remote_code={config_trust_remote_code}, force_download=True")
+                    loaded_config = LLaDAConfig.from_pretrained(
+                        config_model_id,
+                        trust_remote_code=config_trust_remote_code,
+                        force_download=True
+                    )
+                    log("INFO", f"Attempt 2: Loading model explicitly for {config_model_id} using local LLaDAModelLM with trust_remote_code={config_trust_remote_code}, force_download=True")
+                    model = LLaDAModelLM.from_pretrained(
+                        config_model_id,
+                        config=loaded_config,
+                        trust_remote_code=config_trust_remote_code,
+                        force_download=True,
+                        torch_dtype=dtype
+                    ).to(device).eval()
+                    log("INFO", "Attempt 2: Successfully loaded model using fallback LLaDAModelLM.")
+                    model_loaded_successfully = True
+                except Exception as e2:
+                    log("ERROR", f"Attempt 2 (Fallback) loading with LLaDAModelLM also failed: {e2}")
+            else:
+                log("ERROR", f"Attempt 1 failed with an unexpected error (not triggering fallback): {e1}")
+
+        if not model_loaded_successfully or model is None:
+             raise RuntimeError(f"Failed to load PyTorch model '{config_model_id}' after all attempts.")
+
+        log("INFO", "PyTorch model loading process completed.")
+
+    except ImportError as e:
+        log("ERROR", f"Error importing PyTorch/Transformers components: {e}")
+        log("ERROR", "Please ensure torch, transformers, modeling_llada.py, and configuration_llada.py are available.")
+        sys.exit(1)
+    except Exception as e:
+        log("ERROR", f"Error during PyTorch model loading sequence for '{config_model_id}': {e}")
+        sys.exit(1)
+
+elif framework == "mlx":
+    try:
+        from mlx_lm import load as mlx_load_import, generate as mlx_generate_import # type: ignore
+        mlx_generate = mlx_generate_import
+        mlx_load = mlx_load_import
+        log("INFO", "Using Framework: MLX")
+        log("INFO", "Note: MLX performance is best on Apple Silicon. Visualization will be limited.")
+        device = None
+
+        log("INFO", f"Loading MLX model: {config_model_id}...")
+        assert isinstance(config_model_id, str), f"Model ID must be a string, got: {type(config_model_id)}"
+        model, tokenizer = mlx_load(config_model_id)
+        log("INFO", "MLX model loaded successfully.")
+
+    except ImportError:
+        log("ERROR", "Error: 'mlx-lm' library not found.")
+        log("ERROR", "MLX framework requires 'mlx-lm'. Installation failed previously due to potential OS incompatibility or dependency conflicts.")
+        log("ERROR", "Please try 'pip install mlx-lm' manually if you are on macOS with Apple Silicon.")
+        sys.exit(1)
+    except Exception as e:
+        log("ERROR", f"Error loading MLX model '{config_model_id}': {e}")
+        log("ERROR", "Ensure the model ID is correct and you have network access.")
+        log("ERROR", "Also confirm 'mlx-lm' and its dependencies (like 'mlx') are correctly installed.")
+        sys.exit(1)
+
+else:
+    log("ERROR", f"Error: Unknown framework '{framework}' specified in {CONFIG_FILE} or defaults.")
+    sys.exit(1)
+
+# --- Constants ---
 MASK_TOKEN = "[MASK]"
-MASK_ID = 126336  # The token ID of [MASK] in LLaDA
+MASK_ID = tokenizer.mask_token_id if hasattr(tokenizer, 'mask_token_id') and tokenizer.mask_token_id is not None else 126336
+log("INFO", f"Using MASK_ID: {MASK_ID}")
 
+# --- Helper Functions (Parsing) ---
 def parse_constraints(constraints_text):
-    """Parse constraints in format: 'position:word, position:word, ...'"""
     constraints = {}
-    if not constraints_text:
-        return constraints
-        
+    if not constraints_text: return constraints
     parts = constraints_text.split(',')
     for part in parts:
-        if ':' not in part:
-            continue
+        if ':' not in part: continue
         pos_str, word = part.split(':', 1)
         try:
             pos = int(pos_str.strip())
             word = word.strip()
-            if word and pos >= 0:
-                constraints[pos] = word
-        except ValueError:
-            continue
-    
+            if word and pos >= 0: constraints[pos] = word
+        except ValueError: continue
     return constraints
 
 def format_chat_history(history):
-    """
-    Format chat history for the LLaDA model
-    
-    Args:
-        history: List of [user_message, assistant_message] pairs
-        
-    Returns:
-        Formatted conversation for the model
-    """
     messages = []
     for user_msg, assistant_msg in history:
         messages.append({"role": "user", "content": user_msg})
-        if assistant_msg:  # Skip if None (for the latest user message)
-            messages.append({"role": "assistant", "content": assistant_msg})
-    
+        if assistant_msg: messages.append({"role": "assistant", "content": assistant_msg})
     return messages
 
-def add_gumbel_noise(logits, temperature):
-    '''
-    The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-    Thus, we use float64.
-    '''
-    if temperature <= 0:
-        return logits
-        
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-def get_num_transfer_tokens(mask_index, steps):
-    '''
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-    '''
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
-
-    return num_transfer_tokens
-
-def generate_response_with_visualization(model, tokenizer, device, messages, gen_length=64, steps=32, 
+# --- Generation Logic ---
+# ... (generate_response_with_visualization remains the same) ...
+def generate_response_with_visualization(framework, model, tokenizer, device, messages, gen_length=64, steps=32,
                                          constraints=None, temperature=0.0, cfg_scale=0.0, block_length=32,
                                          remasking='low_confidence'):
-    """
-    Generate text with LLaDA model with visualization using the same sampling as in generate.py
-    
-    Args:
-        messages: List of message dictionaries with 'role' and 'content'
-        gen_length: Length of text to generate
-        steps: Number of denoising steps
-        constraints: Dictionary mapping positions to words
-        temperature: Sampling temperature
-        cfg_scale: Classifier-free guidance scale
-        block_length: Block length for semi-autoregressive generation
-        remasking: Remasking strategy ('low_confidence' or 'random')
-        
-    Returns:
-        List of visualization states showing the progression and final text
-    """
-    
-    # Process constraints
-    if constraints is None:
-        constraints = {}
-        
-    # Convert any string constraints to token IDs
-    processed_constraints = {}
-    for pos, word in constraints.items():
-        tokens = tokenizer.encode(" " + word, add_special_tokens=False)
-        for i, token_id in enumerate(tokens):
-            processed_constraints[pos + i] = token_id
-    
-    # Prepare the prompt using chat template
-    chat_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    input_ids = tokenizer(chat_input)['input_ids']
-    input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
-    
-    # For generation
-    prompt_length = input_ids.shape[1]
-    
-    # Initialize the sequence with masks for the response part
-    x = torch.full((1, prompt_length + gen_length), MASK_ID, dtype=torch.long).to(device)
-    x[:, :prompt_length] = input_ids.clone()
-    
-    # Initialize visualization states for the response part
-    visualization_states = []
-    
-    # Add initial state (all masked)
-    initial_state = [(MASK_TOKEN, "#444444") for _ in range(gen_length)]
-    visualization_states.append(initial_state)
-    
-    # Apply constraints to the initial state
-    for pos, token_id in processed_constraints.items():
-        absolute_pos = prompt_length + pos
-        if absolute_pos < x.shape[1]:
-            x[:, absolute_pos] = token_id
-    
-    # Mark prompt positions to exclude them from masking during classifier-free guidance
-    prompt_index = (x != MASK_ID)
-    
-    # Ensure block_length is valid
-    if block_length > gen_length:
-        block_length = gen_length
-    
-    # Calculate number of blocks
-    num_blocks = gen_length // block_length
-    if gen_length % block_length != 0:
-        num_blocks += 1
-    
-    # Adjust steps per block
-    steps_per_block = steps // num_blocks
-    if steps_per_block < 1:
-        steps_per_block = 1
-    
-    # Track the current state of x for visualization
-    current_x = x.clone()
+    global MASK_ID
+    yield "Starting generation...", [], None
 
-    # Process each block
-    for num_block in range(num_blocks):
-        # Calculate the start and end indices for the current block
-        block_start = prompt_length + num_block * block_length
-        block_end = min(prompt_length + (num_block + 1) * block_length, x.shape[1])
-        
-        # Get mask indices for the current block
-        block_mask_index = (x[:, block_start:block_end] == MASK_ID)
-        
-        # Skip if no masks in this block
-        if not block_mask_index.any():
-            continue
-        
-        # Calculate number of tokens to unmask at each step
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
-        
-        # Process each step
-        for i in range(steps_per_block):
-            # Get all mask positions in the current sequence
-            mask_index = (x == MASK_ID)
-            
-            # Skip if no masks
-            if not mask_index.any():
-                break
-            
-            # Apply classifier-free guidance if enabled
-            if cfg_scale > 0.0:
-                un_x = x.clone()
-                un_x[prompt_index] = MASK_ID
-                x_ = torch.cat([x, un_x], dim=0)
-                logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x).logits
-            
-            # Apply Gumbel noise for sampling
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-            
-            # Calculate confidence scores for remasking
-            if remasking == 'low_confidence':
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                x0_p = torch.squeeze(
-                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
-            elif remasking == 'random':
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-            else:
-                raise NotImplementedError(f"Remasking strategy '{remasking}' not implemented")
-            
-            # Don't consider positions beyond the current block
-            x0_p[:, block_end:] = -float('inf')
-            
-            # Apply predictions where we have masks
-            old_x = x.clone()
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, -float('inf'))
-            
-            # Select tokens to unmask based on confidence
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(confidence.shape[0]):
-                # Only consider positions within the current block for unmasking
-                block_confidence = confidence[j, block_start:block_end]
-                if i < steps_per_block - 1:  # Not the last step
-                    # Take top-k confidences
-                    _, select_indices = torch.topk(block_confidence, 
-                                                  k=min(num_transfer_tokens[j, i].item(), 
-                                                       block_confidence.numel()))
-                    # Adjust indices to global positions
-                    select_indices = select_indices + block_start
-                    transfer_index[j, select_indices] = True
-                else:  # Last step - unmask everything remaining
-                    transfer_index[j, block_start:block_end] = mask_index[j, block_start:block_end]
-            
-            # Apply the selected tokens
-            x = torch.where(transfer_index, x0, x)
-            
-            # Ensure constraints are maintained
+    if framework == "torch":
+        try:
+            yield "Processing constraints...", [], None
+            if constraints is None: constraints = {}
+            processed_constraints = {}
+            for pos, word in constraints.items():
+                tokens = tokenizer.encode(" " + word, add_special_tokens=False)
+                for i, token_id in enumerate(tokens):
+                    processed_constraints[pos + i] = token_id
+
+            yield "Preparing prompt...", [], None
+            log("DEBUG", f"Messages before apply_chat_template (PyTorch): {messages}")
+            chat_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            input_ids = tokenizer(chat_input, return_tensors="pt")['input_ids'].to(device)
+
+            prompt_length = input_ids.shape[1]
+            x = torch.full((1, prompt_length + gen_length), MASK_ID, dtype=torch.long).to(device)
+            x[:, :prompt_length] = input_ids.clone()
+
+            initial_state = [(MASK_TOKEN, "#444444") for _ in range(gen_length)]
+            yield "Initializing sequence...", initial_state, None
+
             for pos, token_id in processed_constraints.items():
                 absolute_pos = prompt_length + pos
                 if absolute_pos < x.shape[1]:
                     x[:, absolute_pos] = token_id
-            
-            # Create visualization state only for the response part
-            current_state = []
-            for i in range(gen_length):
-                pos = prompt_length + i  # Absolute position in the sequence
-                
-                if x[0, pos] == MASK_ID:
-                    # Still masked
-                    current_state.append((MASK_TOKEN, "#444444"))  # Dark gray for masks
-                    
-                elif old_x[0, pos] == MASK_ID:
-                    # Newly revealed in this step
-                    token = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
-                    # Color based on confidence
-                    confidence = float(x0_p[0, pos].cpu())
-                    if confidence < 0.3:
-                        color = "#FF6666"  # Light red
-                    elif confidence < 0.7:
-                        color = "#FFAA33"  # Orange
-                    else:
-                        color = "#66CC66"  # Light green
-                        
-                    current_state.append((token, color))
-                    
-                else:
-                    # Previously revealed
-                    token = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
-                    current_state.append((token, "#6699CC"))  # Light blue
-            
-            visualization_states.append(current_state)
-    
-    # Extract final text (just the assistant's response)
-    response_tokens = x[0, prompt_length:]
-    final_text = tokenizer.decode(response_tokens, 
-                               skip_special_tokens=True,
-                               clean_up_tokenization_spaces=True)
-    
-    return visualization_states, final_text
 
+            prompt_index = (x != MASK_ID)
+
+            if block_length > gen_length: block_length = gen_length
+            num_blocks = (gen_length + block_length - 1) // block_length
+            steps_per_block = steps // num_blocks
+            if steps_per_block < 1: steps_per_block = 1
+
+            for num_block in range(num_blocks):
+                block_start = prompt_length + num_block * block_length
+                block_end = min(prompt_length + (num_block + 1) * block_length, x.shape[1])
+                block_mask_index = (x[:, block_start:block_end] == MASK_ID)
+
+                if not block_mask_index.any(): continue
+
+                num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+                for i in range(steps_per_block):
+                    yield f"Running Block {num_block+1}/{num_blocks}, Step {i+1}/{steps_per_block}...", None, None
+                    mask_index = (x == MASK_ID)
+                    if not mask_index.any(): break
+
+                    if cfg_scale > 0.0:
+                        un_x = x.clone()
+                        un_x[prompt_index] = MASK_ID
+                        x_ = torch.cat([x, un_x], dim=0)
+                        model_outputs = model(input_ids=x_)
+                        logits = getattr(model_outputs, 'logits', model_outputs[0])
+                        logits, un_logits = torch.chunk(logits, 2, dim=0)
+                        logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    else:
+                        model_outputs = model(input_ids=x)
+                        logits = getattr(model_outputs, 'logits', model_outputs[0])
+
+                    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+                    if remasking == 'low_confidence':
+                        p = F.softmax(logits.to(torch.float64), dim=-1)
+                        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    elif remasking == 'random':
+                        x0_p = torch.rand_like(x0, dtype=torch.float)
+                    else:
+                        raise NotImplementedError(f"Remasking strategy '{remasking}' not implemented")
+
+                    x0_p[:, block_end:] = -float('inf')
+                    old_x = x.clone()
+                    x0 = torch.where(mask_index, x0, x)
+                    confidence = torch.where(mask_index, x0_p, -float('inf'))
+
+                    transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+                    for j in range(confidence.shape[0]):
+                        block_confidence = confidence[j, block_start:block_end]
+                        current_k = num_transfer_tokens[j, i].item()
+                        k_safe = min(current_k, block_confidence.numel())
+                        if k_safe <= 0: continue
+
+                        if i < steps_per_block - 1:
+                            _, select_indices = torch.topk(block_confidence, k=int(k_safe))
+                            select_indices = select_indices + block_start
+                            transfer_index[j, select_indices] = True
+                        else:
+                            transfer_index[j, block_start:block_end] = mask_index[j, block_start:block_end]
+
+                    x = torch.where(transfer_index, x0, x)
+
+                    for pos, token_id in processed_constraints.items():
+                        absolute_pos = prompt_length + pos
+                        if absolute_pos < x.shape[1]:
+                            x[:, absolute_pos] = token_id
+
+                    current_state = []
+                    for i_vis in range(gen_length):
+                        pos = prompt_length + i_vis
+                        token_id_vis = x[0, pos].item()
+                        old_token_id_vis = old_x[0, pos].item()
+
+                        if token_id_vis == MASK_ID:
+                            current_state.append((MASK_TOKEN, "#444444"))
+                        elif old_token_id_vis == MASK_ID:
+                            token = tokenizer.decode([token_id_vis], skip_special_tokens=True)
+                            confidence_val = float(x0_p[0, pos].cpu())
+                            color = "#66CC66"
+                            if confidence_val < 0.3: color = "#FF6666"
+                            elif confidence_val < 0.7: color = "#FFAA33"
+                            current_state.append((token, color))
+                        else:
+                            token = tokenizer.decode([token_id_vis], skip_special_tokens=True)
+                            current_state.append((token, "#6699CC"))
+                    yield None, current_state, None
+
+            response_tokens = x[0, prompt_length:]
+            final_text = tokenizer.decode(response_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            yield "Generation complete.", None, final_text
+
+        except Exception as e:
+             error_msg = f"Error during PyTorch generation: {str(e)}"
+             print(error_msg)
+             log("ERROR", error_msg)
+             yield error_msg, [(error_msg, "red")], error_msg
+
+
+    elif framework == "mlx":
+        try:
+            yield "Generating with MLX...", [], None
+            log("DEBUG", f"Messages before apply_chat_template (MLX): {messages}")
+            chat_input = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+
+            if constraints:
+                print("Warning: Constraints are not directly applied in MLX generation via mlx_lm.")
+
+            response_text = mlx_generate(model, tokenizer, prompt=chat_input, max_tokens=gen_length, temp=temperature if temperature > 0 else 0.0, verbose=False) # type: ignore
+
+            final_state = []
+            if tokenizer:
+                final_tokens = tokenizer.encode(response_text, add_special_tokens=False) # type: ignore
+                for i in range(gen_length):
+                    if i < len(final_tokens):
+                         token_str = tokenizer.decode([final_tokens[i]], skip_special_tokens=True) # type: ignore
+                         final_state.append((token_str, "#6699CC"))
+                    else:
+                         final_state.append((MASK_TOKEN, "#444444"))
+            else:
+                final_state = [(response_text, "#6699CC")]
+
+            yield "Generation complete (MLX).", final_state, response_text
+
+        except Exception as e:
+             error_msg = f"Error during MLX generation: {str(e)}"
+             print(error_msg)
+             log("ERROR", error_msg)
+             yield error_msg, [(error_msg, "red")], error_msg
+
+    else:
+        raise ValueError(f"Unsupported framework in generate_response: {framework}")
+
+# --- Gradio UI ---
 css = '''
 .category-legend{display:none}
 button{height: 60px}
@@ -295,218 +406,219 @@ button{height: 60px}
 def create_chatbot_demo():
     with gr.Blocks(css=css) as demo:
         gr.Markdown("# LLaDA - Large Language Diffusion Model Demo")
+        device_label = "CPU"
+        if framework == "torch" and device == "cuda":
+            device_label = "CUDA GPU"
+        elif framework == "mlx":
+            device_label = "MLX (CPU/GPU)"
+        loaded_model_id = config_model_id
+        gr.Markdown(f"Using Framework: **{framework.upper()}** | Running on: **{device_label}** | Model: **{loaded_model_id}**")
         gr.Markdown("[model](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct), [project page](https://ml-gsai.github.io/LLaDA-demo/)")
-        
-        # STATE MANAGEMENT
+
         chat_history = gr.State([])
-        
-        # UI COMPONENTS
+
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot_ui = gr.Chatbot(label="Conversation", height=500)
-                
-                # Message input
+                chatbot_ui = gr.Chatbot(label="Conversation", height=450)
                 with gr.Group():
                     with gr.Row():
-                        user_input = gr.Textbox(
-                            label="Your Message", 
-                            placeholder="Type your message here...",
-                            show_label=False
-                        )
-                        send_btn = gr.Button("Send")
-                
-                constraints_input = gr.Textbox(
-                    label="Word Constraints", 
-                    info="This model allows for placing specific words at specific positions using 'position:word' format. Example: 1st word once, 6th word 'upon' and 11th word 'time', would be: '0:Once, 5:upon, 10:time",
-                    placeholder="0:Once, 5:upon, 10:time",
-                    value=""
-                )
+                        user_input = gr.Textbox(label="Your Message", placeholder="Type your message here...", show_label=False, scale=3)
+                        send_btn = gr.Button("Send", scale=1)
+                        cancel_btn = gr.Button("Cancel", scale=1) # Added cancel button
+                constraints_input = gr.Textbox(label="Word Constraints", info="PyTorch Only: 'position:word' format. Example: '0:Once, 5:upon, 10:time'", placeholder="0:Once, 5:upon, 10:time", value="")
+                progress_label = gr.Label(label="Status", value="Idle.")
             with gr.Column(scale=2):
-                output_vis = gr.HighlightedText(
-                    label="Denoising Process Visualization",
-                    combine_adjacent=False,
-                    show_legend=True,
-                )
-        
-        # Advanced generation settings
+                output_vis = gr.HighlightedText(label="Denoising Process Visualization (PyTorch Only)", combine_adjacent=False, show_legend=True)
+
         with gr.Accordion("Generation Settings", open=False):
             with gr.Row():
-                gen_length = gr.Slider(
-                    minimum=16, maximum=128, value=64, step=8,
-                    label="Generation Length"
-                )
-                steps = gr.Slider(
-                    minimum=8, maximum=64, value=32, step=4,
-                    label="Denoising Steps"
-                )
+                gen_length = gr.Slider(minimum=16, maximum=128, value=64, step=8, label="Generation Length")
+                steps = gr.Slider(minimum=8, maximum=64, value=16, step=4, label="Denoising Steps (PyTorch Only)")
             with gr.Row():
-                temperature = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.0, step=0.1,
-                    label="Temperature"
-                )
-                cfg_scale = gr.Slider(
-                    minimum=0.0, maximum=2.0, value=0.0, step=0.1,
-                    label="CFG Scale"
-                )
+                temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.1, label="Temperature")
+                cfg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="CFG Scale (PyTorch Only)")
             with gr.Row():
-                block_length = gr.Slider(
-                    minimum=8, maximum=128, value=32, step=8,
-                    label="Block Length"
-                )
-                remasking_strategy = gr.Radio(
-                    choices=["low_confidence", "random"],
-                    value="low_confidence",
-                    label="Remasking Strategy"
-                )
+                block_length = gr.Slider(minimum=8, maximum=128, value=32, step=8, label="Block Length (PyTorch Only)")
+                remasking_strategy = gr.Radio(choices=["low_confidence", "random"], value="low_confidence", label="Remasking Strategy (PyTorch Only)")
             with gr.Row():
-                visualization_delay = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.1, step=0.1,
-                    label="Visualization Delay (seconds)"
-                )
-        
-        # Current response text box (hidden)
-        current_response = gr.Textbox(
-            label="Current Response",
-            placeholder="The assistant's response will appear here...",
-            lines=3,
-            visible=False
-        )
-        
-        # Clear button
-        clear_btn = gr.Button("Clear Conversation")
-        
+                visualization_delay = gr.Slider(minimum=0.0, maximum=1.0, value=0.05, step=0.05, label="Visualization Delay (PyTorch Only, seconds)")
+
+
+        with gr.Row():
+            clear_btn = gr.Button("Clear Conversation")
+            shutdown_btn = gr.Button("Shutdown Server")
+
         # HELPER FUNCTIONS
         def add_message(history, message, response):
-            """Add a message pair to the history and return the updated history"""
             history = history.copy()
             history.append([message, response])
             return history
-            
-        def user_message_submitted(message, history, gen_length, steps, constraints, delay):
-            """Process a submitted user message"""
-            # Skip empty messages
+
+        def user_message_submitted(message, history):
             if not message.strip():
-                # Return current state unchanged
-                history_for_display = history.copy()
-                return history, history_for_display, "", [], ""
-                
-            # Add user message to history
+                return history, history, "", [], "Idle."
             history = add_message(history, message, None)
-            
-            # Format for display - temporarily show user message with empty response
             history_for_display = history.copy()
-            
-            # Clear the input
             message_out = ""
-            
-            # Return immediately to update UI with user message
-            return history, history_for_display, message_out, [], ""
-            
-        def bot_response(history, gen_length, steps, constraints, delay, temperature, cfg_scale, block_length, remasking):
-            """Generate bot response for the latest message"""
-            if not history:
-                return history, [], ""
-                
-            # Get the last user message
+            return history, history_for_display, message_out, [], "Generating..."
+
+        def bot_response_wrapper(history, gen_len, steps_val, constraints, delay, temp, cfg, block_len, remasking):
+            final_text_output = ""
+            if not history or history[-1][1] is not None:
+                 last_vis_state = []
+                 final_text_output = history[-1][1] if history and history[-1][1] else ""
+                 if history and final_text_output and tokenizer:
+                     try:
+                         log("DEBUG", f"History before format (reconstruct): {history}")
+                         messages_reconstruct = format_chat_history(history)
+                         log("DEBUG", f"Messages after format (reconstruct): {messages_reconstruct}")
+                         final_tokens = tokenizer.encode(final_text_output, add_special_tokens=False) # type: ignore
+                         for i in range(gen_len):
+                             if i < len(final_tokens):
+                                 token_str = tokenizer.decode([final_tokens[i]], skip_special_tokens=True) # type: ignore
+                                 last_vis_state.append((token_str, "#6699CC"))
+                             else:
+                                 last_vis_state.append((MASK_TOKEN, "#444444"))
+                     except Exception as e:
+                         log("ERROR", f"Error reconstructing final state: {e}")
+                         last_vis_state = [(final_text_output, "#6699CC")]
+                 yield history, last_vis_state, "Idle."
+                 return
+
             last_user_message = history[-1][0]
-            
             try:
-                # Format all messages except the last one (which has no response yet)
+                log("DEBUG", f"History before format (generation): {history}")
                 messages = format_chat_history(history[:-1])
-                
-                # Add the last user message
                 messages.append({"role": "user", "content": last_user_message})
-                
-                # Parse constraints
-                parsed_constraints = parse_constraints(constraints)
-                
-                # Generate response with visualization
-                vis_states, response_text = generate_response_with_visualization(
-                    model, tokenizer, device, 
-                    messages, 
-                    gen_length=gen_length, 
-                    steps=steps,
+                log("DEBUG", f"Messages after format (generation): {messages}")
+                parsed_constraints = parse_constraints(constraints) if framework == "torch" else {}
+
+                response_generator = generate_response_with_visualization(
+                    framework, model, tokenizer, device,
+                    messages,
+                    gen_length=gen_len,
+                    steps=steps_val,
                     constraints=parsed_constraints,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    block_length=block_length,
+                    temperature=temp,
+                    cfg_scale=cfg,
+                    block_length=block_len,
                     remasking=remasking
                 )
-                
-                # Update history with the assistant's response
-                history[-1][1] = response_text
-                
-                # Return the initial state immediately
-                yield history, vis_states[0], response_text
-                
-                # Then animate through visualization states
-                for state in vis_states[1:]:
-                    time.sleep(delay)
-                    yield history, state, response_text
-                    
+
+                vis_state = []
+                progress_text = "Starting..."
+                for update in response_generator:
+                    progress_update, vis_update, text_update = update
+                    if progress_update is not None: progress_text = progress_update
+                    if vis_update is not None: vis_state = vis_update
+                    if text_update is not None:
+                        final_text_output = text_update
+                        history[-1][1] = final_text_output
+                    yield history, vis_state, progress_text
+
+            except gr.Error as e:
+                 if "process cancelled" in str(e).lower():
+                     log("INFO", "Generation cancelled by user.")
+                     if history and history[-1][1] is None:
+                         history[-1][1] = "[Cancelled]"
+                     yield history, [], "Cancelled."
+                 else:
+                     log("ERROR", f"Gradio error during generation: {e}")
+                     yield history, [], f"Gradio Error: {e}"
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
-                print(error_msg)
-                
-                # Show error in visualization
+                log("ERROR", f"Error in bot_response_wrapper: {error_msg}")
                 error_vis = [(error_msg, "red")]
-                
-                # Don't update history with error
-                yield history, error_vis, error_msg
-        
+                try:
+                    history[-1][1] = error_msg
+                except IndexError: pass
+                yield history, error_vis, "Error!"
+
+
         def clear_conversation():
-            """Clear the conversation history"""
-            return [], [], "", []
-        
+            return [], [], [], "Idle."
+
+        def shutdown_server():
+            log("INFO", "Shutdown requested via UI button.")
+            print("Attempting server shutdown...")
+            status_update = gr.update(value="Shutting down...")
+            threading.Timer(0.5, lambda: os._exit(0)).start()
+            return status_update
+
+        def cancel_triggered():
+             log("INFO", "Cancel button clicked.")
+             return gr.update(value="Cancelling...")
+
         # EVENT HANDLERS
-        
-        # Clear button handler
-        clear_btn.click(
-            fn=clear_conversation,
-            inputs=[],
-            outputs=[chat_history, chatbot_ui, current_response, output_vis]
-        )
-        
-        # User message submission flow (2-step process)
-        # Step 1: Add user message to history and update UI
-        msg_submit = user_input.submit(
+        clear_btn.click(fn=clear_conversation, inputs=[], outputs=[chat_history, chatbot_ui, output_vis, progress_label])
+        shutdown_btn.click(fn=shutdown_server, inputs=None, outputs=[progress_label])
+
+        trigger_inputs = [
+             chat_history, gen_length, steps, constraints_input,
+             visualization_delay, temperature, cfg_scale, block_length, remasking_strategy
+        ]
+        response_outputs = [chatbot_ui, output_vis, progress_label]
+
+        # Link Submit/Send to Bot Response and make them cancellable by cancel_btn
+        submit_event = user_input.submit(
             fn=user_message_submitted,
-            inputs=[user_input, chat_history, gen_length, steps, constraints_input, visualization_delay],
-            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response]
+            inputs=[user_input, chat_history],
+            outputs=[chat_history, chatbot_ui, user_input, output_vis, progress_label]
+        ).then(
+            fn=bot_response_wrapper,
+            inputs=trigger_inputs,
+            outputs=response_outputs,
+            show_progress="hidden"
         )
-        
-        # Also connect the send button
-        send_click = send_btn.click(
+
+        send_event = send_btn.click(
             fn=user_message_submitted,
-            inputs=[user_input, chat_history, gen_length, steps, constraints_input, visualization_delay],
-            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response]
+            inputs=[user_input, chat_history],
+            outputs=[chat_history, chatbot_ui, user_input, output_vis, progress_label]
+        ).then(
+            fn=bot_response_wrapper,
+            inputs=trigger_inputs,
+            outputs=response_outputs,
+            show_progress="hidden"
         )
-        
-        # Step 2: Generate bot response
-        # This happens after the user message is displayed
-        msg_submit.then(
-            fn=bot_response,
-            inputs=[
-                chat_history, gen_length, steps, constraints_input, 
-                visualization_delay, temperature, cfg_scale, block_length,
-                remasking_strategy
-            ],
-            outputs=[chatbot_ui, output_vis, current_response]
-        )
-        
-        send_click.then(
-            fn=bot_response,
-            inputs=[
-                chat_history, gen_length, steps, constraints_input, 
-                visualization_delay, temperature, cfg_scale, block_length,
-                remasking_strategy
-            ],
-            outputs=[chatbot_ui, output_vis, current_response]
-        )
-        
+
+        # Cancel button cancels the submit and send events AND updates status
+        cancel_btn.click(fn=cancel_triggered, inputs=None, outputs=[progress_label], cancels=[submit_event, send_event])
+
     return demo
 
-# Launch the demo
+# --- Browser Launch Logic ---
+def open_browser(url):
+    log("INFO", f"Attempting to open browser at {url} as fallback...")
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        log("ERROR", f"Failed to open browser automatically: {e}")
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    demo = create_chatbot_demo()
-    demo.queue().launch(share=True)
+    if model is None or tokenizer is None:
+        print("Error: Model or Tokenizer failed to load. Exiting.")
+        log("CRITICAL", "Model or Tokenizer failed to load. Exiting.")
+        sys.exit(1)
+
+    demo_instance = create_chatbot_demo()
+    fallback_timer = None
+
+    try:
+        log("INFO", "Launching Gradio app...")
+        default_local_url = "http://127.0.0.1:7860"
+        fallback_timer = threading.Timer(7.0, open_browser, args=[default_local_url])
+        fallback_timer.start()
+
+        demo_instance.queue().launch(share=True, inbrowser=True)
+
+        if fallback_timer is not None and fallback_timer.is_alive():
+             fallback_timer.cancel()
+        log("INFO", "Gradio app shut down.")
+
+    except Exception as e:
+        log("CRITICAL", f"Failed to launch Gradio app: {e}")
+        if fallback_timer is not None and fallback_timer.is_alive():
+            fallback_timer.cancel()
+        sys.exit(1)
