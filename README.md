@@ -57,7 +57,7 @@ _(Note: The command `python -m pip ...` explicitly uses the Python interpreter f
 
 Edit the `model_config.json` file to select the desired model. Set the `active_model_key` to one of the keys defined in `available_models` (e.g., `"default_torch"`, `"base_torch"`).
 
-```json
+<pre><code class="language-json">
 {
   <b>"active_model_key": "default_torch"</b>,
   "available_models": {
@@ -87,7 +87,7 @@ Edit the `model_config.json` file to select the desired model. Set the `active_m
     }
   }
 }
-```
+</code></pre>
 
 **5. Run the Application:**
 
